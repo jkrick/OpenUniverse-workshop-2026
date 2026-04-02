@@ -880,12 +880,12 @@ detection and photometry of astronomical sources (Bradley et al.
 **Authors:** IRSA Data Science Team, including Jessica Krick, Jaladh Singhal, Troy Raen, Brigitta Sipőcz,
 Andreas Faisst, Vandana Desai
 
-**Updated:** 2025-03-24
+**Updated:** 2026-04-02
 
 **Contact:** [IRSA Helpdesk](https://irsa.ipac.caltech.edu/docs/help_desk.html) with questions
 or problems.
 
-**Runtime:** As of the date above, this notebook takes about 200s to run to completion on
+**Runtime:** As of the date above, this notebook takes about 250s to run to completion on
 a machine with 8GB RAM and 4 CPU.
 
 
