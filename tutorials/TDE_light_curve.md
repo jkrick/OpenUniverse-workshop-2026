@@ -191,7 +191,9 @@ def show_gallery(files, max_images=9):
 ```
 
 ```{code-cell} ipython3
-show_gallery(files)
+# Number of example images to display. Increase to see more of the available images.
+n_gallery_images = 6
+show_gallery(files, max_images=n_gallery_images)
 ```
 
 
@@ -844,13 +846,16 @@ def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list,
 ```{code-cell} ipython3
 # make cutout gallery of the host galaxy
 
+# Number of cutout images to display. Increase to show more epochs.
+n_cutout_images = 6
+
 single_gal = df.loc[df["galaxy_id"] == favorite].squeeze()
 if single_gal.empty:
     raise ValueError(f"Galaxy {favorite} not found in DataFrame.")
 
-selected_filenames = single_gal[f"image_filenames_{bands[0]}"]
-selected_mjds = single_gal[f"mjd_obs_{bands[0]}"]
-selected_radius_pix = single_gal["aperture_radius_pix"]
+selected_filenames = single_gal[f"image_filenames_{bands[0]}"][:n_cutout_images]
+selected_mjds = single_gal[f"mjd_obs_{bands[0]}"][:n_cutout_images]
+selected_radius_pix = single_gal["aperture_radius_pix"][:n_cutout_images]
 
 cutout_gallery(
     image_filenames=selected_filenames,
