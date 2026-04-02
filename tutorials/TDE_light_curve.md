@@ -265,15 +265,15 @@ Once we have the TDE, we load the corresponding galaxy info parquet file for tha
 
 ```{code-cell} ipython3
 galaxy_info_file = f"{catalog_prefix}/galaxy_{region}.parquet"
-df_candidates = pq.read_table(galaxy_info_file, filesystem=fs,
+host_galaxy = pq.read_table(galaxy_info_file, filesystem=fs,
                               # filter while reading pq for time efficiency
                               filters=[("galaxy_id", "==", tde_info["host_id"])]
                               ).to_pandas()
-df_candidates
+host_galaxy
 ```
 
 ## 3. Image Access
-Now we have `df_candidates` as a catalog of host galaxy(s) for our TDE target, including their positions and IDs. With those coordinates in hand, we then query the corresponding Roman and Rubin image files that overlap this same region, retrieving only the fits files needed for subsequent photometry and light-curve analysis.
+Now we have `host_galaxy` with the host galaxy for our TDE target, including its position and ID. With those coordinates in hand, we then query the Roman image files that overlap this region, retrieving only the files needed for subsequent photometry and light-curve analysis.
 
 ```{code-cell} ipython3
 # Make astroquery IRSA queries point to the simulated VO endpoints
@@ -303,25 +303,25 @@ def get_s3_fpath(cloud_access):
     return f's3://{bucket_name}/{key}'
 ```
 
-First, we find the filenames of the images in the Roman TDS survey which include these galaxy candidates.
+First, we find the filenames of the images in the Roman TDS survey which include the TDE host galaxy.
 
 ```{code-cell} ipython3
 ---
 jupyter:
   source_hidden: true
 ---
-def TDS_image_search(df_candidates, radius, bandname):
+def Roman_TDS_image_search(host_galaxy, radius, bandname):
     """
-    Get OpenUniverse2024 Roman TDS images for each galaxy candidate.
+    Get OpenUniverse2024 Roman TDS images for the TDE host galaxy.
 
     Parameters
     ----------
-    df_candidates : pandas.DataFrame
+    host_galaxy : pandas.DataFrame
         Must include 'galaxy_id', 'ra', and 'dec' columns.
     radius : astropy.units.Quantity
         Search radius.
     bandname : string
-        Bandname for which to do photometry.
+        Roman bandname for which to search images (e.g. 'J129', 'H158').
 
     Returns
     -------
@@ -329,33 +329,34 @@ def TDS_image_search(df_candidates, radius, bandname):
         Dictionary where keys are galaxy IDs and values are SIA result tables
         with an added 's3_uri' column for the image file paths.
     """
-    image_map = {}
-    for _, row in df_candidates.iterrows():
-        galaxy_id = int(row["galaxy_id"])
-        ra_center, dec_center = row["ra"], row["dec"]
-        print(f"Accessing images in band={bandname} for galaxy_id={galaxy_id} at RA={ra_center:.3f}, Dec={dec_center:.3f} ...", end="")
+    row = host_galaxy.iloc[0]
+    galaxy_id = int(row["galaxy_id"])
+    ra_center, dec_center = row["ra"], row["dec"]
+    print(f"Accessing images in band={bandname} for galaxy_id={galaxy_id} at RA={ra_center:.3f}, Dec={dec_center:.3f} ...", end="")
 
-        coords = SkyCoord(ra_center, dec_center, unit='deg')
-        sia_results = Irsa.query_sia(pos=(coords, radius.to(u.deg)), collection=OU_ROMAN_SIA_COLLECTION)
-        filtered_results = sia_results[['TDS_simple_model' in row['obs_id'] and bandname in row['energy_bandpassname']
-                                        for row in sia_results]]
-        filtered_results['s3_uri'] = [get_s3_fpath(row['cloud_access']) for row in filtered_results]
+    coords = SkyCoord(ra_center, dec_center, unit='deg')
+    sia_results = Irsa.query_sia(pos=(coords, radius.to(u.deg)), collection=OU_ROMAN_SIA_COLLECTION)
+    filtered_results = sia_results[['TDS_simple_model' in r['obs_id'] and bandname in r['energy_bandpassname']
+                                    for r in sia_results]]
+    filtered_results['s3_uri'] = [get_s3_fpath(r['cloud_access']) for r in filtered_results]
 
-        print(f"done. Found {len(filtered_results)} images.")
-        image_map[galaxy_id] = filtered_results
-
-    return image_map
+    print(f"done. Found {len(filtered_results)} images.")
+    return {galaxy_id: filtered_results}
 ```
 
 ```{code-cell} ipython3
-bandname = "J129"
-image_search_radius = 1 * u.arcsec # point-like since we just need images containing the candidate
-candidates_images = TDS_image_search(df_candidates, image_search_radius, bandname)
+bands = ["J129", "H158"]
+image_search_radius = 1 * u.arcsec # point-like since we just need images containing the host galaxy
+
+all_band_images = {}
+for bandname in bands:
+    all_band_images[bandname] = Roman_TDS_image_search(host_galaxy, image_search_radius, bandname)
 ```
 
-Since there are > 100 TDS images for each candidate, we will:
-1. filter out images where candidate is close to the edge of image so that photometry is more reliable and partial cutouts can be avoided.
-2. select only a sample of images based on MJD quantiles so that photometry is quicker to run.
+Since there are > 100 TDS images per band, we will:
+1. restrict to images taken during the TDE event window (`start_mjd` to `end_mjd` from the transient catalog) so the light curve focuses on the TDE itself rather than the full survey duration.
+2. filter out images where the host galaxy is close to the edge so that photometry is more reliable and partial cutouts can be avoided.
+3. select only an evenly time-sampled subset of images so that photometry is quicker to run.
 
 ```{code-cell} ipython3
 ---
@@ -388,51 +389,53 @@ def select_images_by_mjd_quantiles(images, n_select=9):
 ```
 
 ```{code-cell} ipython3
-image_filenames = []
+galaxy_id = int(host_galaxy.iloc[0]["galaxy_id"])
 
-for _, row in df_candidates.iterrows():
-    galaxy_id = int(row["galaxy_id"])
-    candidate_images_tbl = candidates_images[galaxy_id]
+for bandname in bands:
+    image_tbl = all_band_images[bandname][galaxy_id]
 
-    # 1. filter out images where candidate is close to the edge of image
-    # 'dist_to_point' is the distance from the center of the image to the candidate
+    # 1. restrict to images within the TDE event window
+    tde_start, tde_end = tde_info["start_mjd"], tde_info["end_mjd"]
+    in_window = [tde_start <= r['t_min'] <= tde_end for r in image_tbl]
+    selected_images = image_tbl[in_window]
+
+    # 2. filter out images where the host galaxy is close to the edge of image
+    # 'dist_to_point' is the distance from the center of the image to the host galaxy
     # 's_fov' is the estimated diameter of the circular region covered by the image
-    # so we keep images where candidate is within 0.45 * s_fov (= 90% from the image center)
-    selected_images = candidate_images_tbl[[row['dist_to_point'] < (0.45 * row['s_fov'])
-                                            for row in candidate_images_tbl]]
+    # so we keep images where the host galaxy is within 0.45 * s_fov (= 90% from the image center)
+    not_on_edge = [r['dist_to_point'] < (0.45 * r['s_fov']) for r in selected_images]
+    selected_images = selected_images[not_on_edge]
 
-    # 2. select images by MJD quantiles
+    # 3. select an evenly time-sampled subset
     selected_images = select_images_by_mjd_quantiles(selected_images)
-    print(f"Galaxy {galaxy_id}: Downsampled {len(candidate_images_tbl)} images to {len(selected_images)} images.")
-    
-    image_filenames.append(selected_images['s3_uri'].tolist())
+    print(f"Band {bandname}, Galaxy {galaxy_id}: Downsampled {len(image_tbl)} images to {len(selected_images)} images.")
 
-# add the S3 URIs of the selected images as a new column in the candidates dataframe
-df_candidates["image_filenames"] = image_filenames
+    # store per-band image filenames as a band-specific column
+    host_galaxy[f"image_filenames_{bandname}"] = [selected_images['s3_uri'].tolist()]
 ```
 
 ```{code-cell} ipython3
-# check if we have a nested column of image filenames for each candidate
-df_candidates
+# check if we have a nested column of image filenames for the host galaxy
+host_galaxy
 ```
 
 ## 4.  Make a Light Curve
-This section demonstrates how to extract and visualize a light curve for a Tidal Disruption Event using simulated Roman images. 
+This section demonstrates how to extract and visualize a light curve for a Tidal Disruption Event using simulated Roman images in two bands (J129 and H158).
 The first function, `run_aperture_photometry()`, performs simple circular aperture photometry on a set of FITS images from S3 using the astropy [photutils](https://photutils.readthedocs.io/en/stable/) package. 
-The second function, `plot_light_curve()`, then compiles these measurements into a time-ordered plot showing how the observed flux evolves across multiple visits, providing a first look at temporal variability that could signal transient activity or host-galaxy changes.
+The two plotting functions then compile these measurements into time-ordered plots showing how the observed flux evolves across multiple visits, providing a first look at temporal variability that could signal transient activity or host-galaxy changes.
 
 ```{code-cell} ipython3
 ---
 jupyter:
   source_hidden: true
 ---
-def run_aperture_photometry(df_candidates, bandname, image_column="image_filenames", aperture_radius=1.0):
+def run_aperture_photometry(host_galaxy, bandname, image_column="image_filenames", aperture_radius=1.0):
     """
     Perform circular aperture photometry on a list of FITS images.
 
     Parameters
     ----------
-    df_candidates : pandas.DataFrame
+    host_galaxy : pandas.DataFrame
         Must contain columns 'ra', 'dec', and a nested column with FITS image paths
         (each a list of FITS image paths).
     bandname : string
@@ -451,81 +454,71 @@ def run_aperture_photometry(df_candidates, bandname, image_column="image_filenam
          'aperture_radius_pix', 'background']
     """
 
-    #store photometry for all rows in the dataframe
-    #these will be lists of lists
-    mjd_all, flux_all, flux_err_all, aperture_radius_pix_all = [], [], [], []
+    row = host_galaxy.iloc[0]
+    filenames = row[image_column]
+    print(f"Performing photometry for {len(filenames)} sampled images "
+          f"for host galaxy at RA={row['ra']:.3f}, Dec={row['dec']:.3f} ...", end="")
 
-    #for each candidate galaxy:
-    for idx, row in df_candidates.iterrows():
-        filenames = row[image_column]
-        print(f"Performing photometry for {len(filenames)} sampled images "
-              f"for the candidate at RA={row['ra']:.3f}, Dec={row['dec']:.3f} ...", end="")
+    mjd_list, flux_list, flux_err_list, aperture_radius_pix_list = [], [], [], []
 
+    for fname in filenames:
 
-        #setup to store for each candidate galaxy
-        mjd_list, flux_list, flux_err_list, aperture_radius_pix_list = [], [], [], []
+        #opening a gzipped fits file, don't recommend changing the next line.
+        with fits.open(fname, fsspec_kwargs={"anon": True}, memmap=False) as hdul:
+            data = hdul[1].data
+            header = hdul[1].header
 
+            # Build a WCS object so photutils can convert between sky and pixel coordinates.
+            wcs = WCS(header)
 
-        for fname in filenames:
+            # Simple circular aperture centered on the host galaxy position
+            sky_position = SkyCoord(row["ra"], row["dec"], unit="deg", frame="icrs")
+            aperture = SkyCircularAperture(sky_position, r=aperture_radius * u.arcsec)
+            pixel_aperture = aperture.to_pixel(wcs)
 
-            #opening a gzipped fits file, don't recommend changing the next line.
-            with fits.open(fname, fsspec_kwargs={"anon": True}, memmap=False) as hdul:
-                data = hdul[1].data
-                header = hdul[1].header
+            # Perform aperture photometry
+            phot_table = aperture_photometry(data, aperture, wcs=wcs)
 
-                # Build a WCS object so photutils can convert between sky and pixel coordinates.
-                wcs = WCS(header)
+            # Check output (optional)
+            #print(phot_table)
 
-                # Simple circular aperture centered on the candidate galaxy position
-                sky_position = SkyCoord(row["ra"], row["dec"], unit="deg", frame="icrs")
-                aperture = SkyCircularAperture(sky_position, r=aperture_radius * u.arcsec)
-                pixel_aperture = aperture.to_pixel(wcs)
+            # Background estimate (median of finite pixels)
+            background = np.nanmedian(data)
 
-                # Perform aperture photometry
-                phot_table = aperture_photometry(data, aperture, wcs=wcs)
+            # Subtract background from aperture sum
+            aperture_area = pixel_aperture.area
+            flux = phot_table['aperture_sum'][0] - background * aperture_area
 
-                # Check output (optional)
-                #print(phot_table)
+            # Approximate uncertainty from background rms
+            flux_err = np.nanstd(data) * np.sqrt(aperture_area)
 
-                # Background estimate (median of finite pixels)
-                background = np.nanmedian(data)
+            # Observation mid-time from MJD-OBS
+            mjd_obs = header.get('MJD-OBS', None)
 
-                # Subtract background from aperture sum
-                aperture_area = pixel_aperture.area
-                flux = phot_table['aperture_sum'][0] - background * aperture_area
+            #store related info
+            mjd_list.append(mjd_obs)
+            flux_list.append(flux)
+            flux_err_list.append(flux_err)
+            aperture_radius_pix_list.append(float(pixel_aperture.r))
 
-                # Approximate uncertainty from background rms
-                flux_err = np.nanstd(data) * np.sqrt(aperture_area)
-
-                # Observation mid-time from MJD-OBS
-                mjd_obs = header.get('MJD-OBS', None)
-
-                #store related info
-                mjd_list.append(mjd_obs)
-                flux_list.append(flux)
-                flux_err_list.append(flux_err)
-                aperture_radius_pix_list.append(float(pixel_aperture.r))
-
-
-        mjd_all.append(mjd_list)
-        flux_all.append(flux_list)
-        flux_err_all.append(flux_err_list)
-        aperture_radius_pix_all.append(aperture_radius_pix_list)
-        print("done.")
-
+    print("done.")
 
     # Add as nested columns
-    df_candidates["mjd_obs"] = mjd_all
-    df_candidates[f"flux_{bandname}"] = flux_all
-    df_candidates[f"flux_err_{bandname}"] = flux_err_all
-    df_candidates["aperture_radius_pix"] = aperture_radius_pix_all
+    host_galaxy[f"mjd_obs_{bandname}"] = [mjd_list]
+    host_galaxy[f"flux_{bandname}"] = [flux_list]
+    host_galaxy[f"flux_err_{bandname}"] = [flux_err_list]
+    host_galaxy["aperture_radius_pix"] = [aperture_radius_pix_list]
 
-    return df_candidates
+    return host_galaxy
 ```
 
 ```{code-cell} ipython3
 # We choose an aperture radius of 1.0 arcsec(~9 Roman pixels at 0.11"/pix)
-df = run_aperture_photometry(df_candidates, bandname, aperture_radius= 1.0)
+for bandname in bands:
+    host_galaxy = run_aperture_photometry(host_galaxy, bandname,
+                                            image_column=f"image_filenames_{bandname}",
+                                            aperture_radius=1.0)
+df = host_galaxy
 ```
 
 ```{code-cell} ipython3
@@ -538,7 +531,7 @@ df
 jupyter:
   source_hidden: true
 ---
-def plot_single_light_curve(df, galaxy_id, bandname):
+def plot_single_band_light_curve(df, galaxy_id, bandname, start_mjd):
     """
     Plot a single galaxy's light curve from a DataFrame, with error bars.
 
@@ -550,7 +543,9 @@ def plot_single_light_curve(df, galaxy_id, bandname):
     galaxy_id : int or str
         Galaxy identifier to plot.
     bandname : str
-        Photometric band name used for column labels .
+        Photometric band name used for column labels.
+    start_mjd : float
+        MJD of the TDE start, used to set the x-axis origin.
 
     Returns
     -------
@@ -565,7 +560,7 @@ def plot_single_light_curve(df, galaxy_id, bandname):
 
     # Extract nested arrays
     #need to go to numpy so we can check for non-finite values
-    times = np.array(row["mjd_obs"], dtype=float)
+    times = np.array(row[f"mjd_obs_{bandname}"], dtype=float) - start_mjd
     fluxes = np.array(row[f"flux_{bandname}"], dtype=float)
     flux_errs = np.array(row[f"flux_err_{bandname}"], dtype=float)
 
@@ -581,6 +576,11 @@ def plot_single_light_curve(df, galaxy_id, bandname):
     sort_idx = np.argsort(times)
     times, fluxes, flux_errs = times[sort_idx], fluxes[sort_idx], flux_errs[sort_idx]
 
+    # Normalize to median flux
+    median_flux = np.median(fluxes)
+    fluxes = fluxes / median_flux
+    flux_errs = flux_errs / median_flux
+
     # Plot
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.errorbar(
@@ -588,8 +588,8 @@ def plot_single_light_curve(df, galaxy_id, bandname):
     )
     ax.plot(times, fluxes, "-", alpha=0.6, color=ax.get_lines()[-1].get_color())
 
-    ax.set_xlabel("MJD")
-    ax.set_ylabel(f"Flux ({bandname})")
+    ax.set_xlabel("Days since start of TDE")
+    ax.set_ylabel("Normalized Flux")
     ax.set_title(f"Light Curve for Galaxy {galaxy_id} ({bandname})")
     ax.legend()
 
@@ -606,40 +606,40 @@ def plot_single_light_curve(df, galaxy_id, bandname):
 jupyter:
   source_hidden: true
 ---
-def plot_candidate_light_curves(df, bandname):
+def plot_multiband_light_curve(df, bands, start_mjd):
     """
-    Plot all candidate light curves color-coded by galaxy_id,
+    Plot the TDE host galaxy light curve for multiple bands on a single axes.
 
     Parameters
     ----------
     df : pandas.DataFrame
-        Must contain 'galaxy_id', 'mjd_obs', f'flux_{bandname}',
-        and optionally f'flux_err_{bandname}'.
-    bandname : str
-        Photometric band name .
+        Must contain f'mjd_obs_{{band}}', f'flux_{{band}}', and
+        f'flux_err_{{band}}' columns for each band in `bands`.
+    bands : list of str
+        Roman band names to plot (e.g. ['J129', 'H158']).
+    start_mjd : float
+        MJD of the TDE start, used to set the x-axis origin.
 
     Returns
     -------
     matplotlib.figure.Figure
-        Combined plot figure.
+        The generated figure.
     """
-    #setup for plotting
-    fig, ax = plt.subplots(figsize=(7, 5))
     colors = itertools.cycle(plt.cm.tab10.colors)
 
-    #for each candidate host galaxy
-    for _, row in df.iterrows():
-        galaxy_id = row["galaxy_id"]
+    fig, ax = plt.subplots(figsize=(7, 5))
+    row = df.iloc[0]
+    xmin, xmax = np.inf, -np.inf
 
+    for bandname in bands:
         # Extract nested arrays
         #need to go to numpy so we can check for non-finite values
-        times = np.array(row["mjd_obs"], dtype=float)
+        times = np.array(row[f"mjd_obs_{bandname}"], dtype=float) - start_mjd
         fluxes = np.array(row[f"flux_{bandname}"], dtype=float)
         flux_errs = np.array(row[f"flux_err_{bandname}"], dtype=float)
 
         # Drop invalid
-        mask = np.isfinite(times) & np.isfinite(fluxes)
-        mask &= np.isfinite(flux_errs)
+        mask = np.isfinite(times) & np.isfinite(fluxes) & np.isfinite(flux_errs)
         times, fluxes, flux_errs = times[mask], fluxes[mask], flux_errs[mask]
 
         if len(times) == 0:  #empty photometry
@@ -649,18 +649,23 @@ def plot_candidate_light_curves(df, bandname):
         sort_idx = np.argsort(times)
         times, fluxes, flux_errs = times[sort_idx], fluxes[sort_idx], flux_errs[sort_idx]
 
-        #plot
+        # Normalize to median flux
+        median_flux = np.median(fluxes)
+        fluxes = fluxes / median_flux
+        flux_errs = flux_errs / median_flux
+
         color = next(colors)
         ax.errorbar(times, fluxes, yerr=flux_errs, fmt="o", capsize=3,
-                    color=color, label=str(galaxy_id))
-        ax.plot(times, fluxes, "-", color=color, alpha=0.6)
+                    color=color, label=bandname)
+        ax.plot(times, fluxes, "-", alpha=0.6, color=color)
 
-        xmin, xmax = times.min(), times.max()
+        xmin = min(xmin, times.min())
+        xmax = max(xmax, times.max())
 
-    ax.set_xlabel("MJD")
-    ax.set_ylabel(f"Flux ({bandname})")
-    ax.set_title(f"Candidate Light Curves ({bandname})")
-    ax.legend(title="Galaxy ID", fontsize="small")
+    ax.set_xlabel("Days since start of TDE")
+    ax.set_ylabel("Normalized Flux")
+    ax.set_title("TDE Host Galaxy Light Curve")
+    ax.legend(fontsize="small")
 
     # Restrict x-axis to data range with padding
     margin = 0.05 * (xmax - xmin) if xmax > xmin else 0.1
@@ -673,11 +678,11 @@ def plot_candidate_light_curves(df, bandname):
 ```{code-cell} ipython3
 #grab one of the galaxy_ids from the printed out dataframe above
 favorite = int(df.iloc[0]['galaxy_id'])
-fig_single = plot_single_light_curve(df, favorite, bandname)
+fig_single = plot_single_band_light_curve(df, favorite, bands[0], start_mjd=tde_info["start_mjd"])
 ```
 
 ```{code-cell} ipython3
-fig_all_candidates = plot_candidate_light_curves(df, bandname)
+fig_light_curves = plot_multiband_light_curve(df, bands, start_mjd=tde_info["start_mjd"])
 ```
 
 ## 5. Make Cutouts
@@ -719,15 +724,7 @@ def make_cutout(fname, ra, dec, size=100):
             [header["CD1_1"], header["CD1_2"]],
             [header["CD2_1"], header["CD2_2"]],
         ])
-        orientation = header.get("ORIENTAT", 0.0)
-        sca = header.get("SCA_ID", 0)
-
-        # Flip chips if needed
-        if sca % 3 == 0:
-            orientation += 180
-
-        # Rotation matrix (inverse because we rotate image)
-        angle = orientation
+        angle = header.get("ORIENTAT", 0.0)
         rot_img = rotate(img, angle=angle, reshape=False, cval=np.nan)
 
         # Update header for rotated WCS
@@ -810,12 +807,12 @@ def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list,
     # Build figure title if information is available
     if galaxy_id is not None:
         fig.suptitle(
-            f"Cutouts of host galaxy candidate {galaxy_id} for TDE event",
+            f"Cutouts of TDE host galaxy {galaxy_id}",
             fontsize=14, y=0.98
         )
     elif galaxy_id is not None:
         fig.suptitle(
-            f"Cutouts for candidate galaxy {galaxy_id}",
+            f"Cutouts for host galaxy {galaxy_id}",
             fontsize=14, y=0.98
         )
 
@@ -845,14 +842,14 @@ def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list,
 ```
 
 ```{code-cell} ipython3
-# make cutout gallery of my favorite candidate
+# make cutout gallery of the host galaxy
 
 single_gal = df.loc[df["galaxy_id"] == favorite].squeeze()
 if single_gal.empty:
     raise ValueError(f"Galaxy {favorite} not found in DataFrame.")
 
-selected_filenames = single_gal["image_filenames"]
-selected_mjds = single_gal["mjd_obs"]
+selected_filenames = single_gal[f"image_filenames_{bands[0]}"]
+selected_mjds = single_gal[f"mjd_obs_{bands[0]}"]
 selected_radius_pix = single_gal["aperture_radius_pix"]
 
 cutout_gallery(
