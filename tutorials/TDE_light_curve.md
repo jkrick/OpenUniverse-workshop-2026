@@ -275,7 +275,7 @@ host_galaxy
 ```
 
 ## 3. Image Access
-Now we have `host_galaxy` with the host galaxy for our TDE target, including its position and ID. With those coordinates in hand, we then query the Roman image files that overlap this region, retrieving only the files needed for subsequent photometry and light-curve analysis.
+Now we have the host galaxy's position and ID in `host_galaxy`, ready for image queries. With those coordinates in hand, we then query the Roman image files that overlap this region, retrieving only the files needed for subsequent photometry and light-curve analysis.
 
 ```{code-cell} ipython3
 # Make astroquery IRSA queries point to the simulated VO endpoints
@@ -343,7 +343,7 @@ def Roman_TDS_image_search(host_galaxy, radius, bandname):
     filtered_results['s3_uri'] = [get_s3_fpath(r['cloud_access']) for r in filtered_results]
 
     print(f"done. Found {len(filtered_results)} images.")
-    return {galaxy_id: filtered_results}
+    return filtered_results
 ```
 
 ```{code-cell} ipython3
@@ -394,7 +394,7 @@ def select_images_by_mjd_quantiles(images, n_select=9):
 galaxy_id = int(host_galaxy.iloc[0]["galaxy_id"])
 
 for bandname in bands:
-    image_tbl = all_band_images[bandname][galaxy_id]
+    image_tbl = all_band_images[bandname]
 
     # 1. restrict to images within the TDE event window
     tde_start, tde_end = tde_info["start_mjd"], tde_info["end_mjd"]
@@ -450,10 +450,10 @@ def run_aperture_photometry(host_galaxy, bandname, image_column="image_filenames
 
     Returns
     -------
-    phot_df : pandas.DataFrame
-        DataFrame containing the photometry results with columns:
-        ['RA', 'Dec', 'mjd_obs', 'filename', 'flux', 'flux_err',
-         'aperture_radius_pix', 'background']
+    None
+        Results are added directly to `host_galaxy` as new columns:
+        f'mjd_obs_{{bandname}}', f'flux_{{bandname}}', f'flux_err_{{bandname}}',
+        and 'aperture_radius_pix'.
     """
 
     row = host_galaxy.iloc[0]
@@ -510,22 +510,19 @@ def run_aperture_photometry(host_galaxy, bandname, image_column="image_filenames
     host_galaxy[f"flux_{bandname}"] = [flux_list]
     host_galaxy[f"flux_err_{bandname}"] = [flux_err_list]
     host_galaxy["aperture_radius_pix"] = [aperture_radius_pix_list]
-
-    return host_galaxy
 ```
 
 ```{code-cell} ipython3
 # We choose an aperture radius of 1.0 arcsec(~9 Roman pixels at 0.11"/pix)
 for bandname in bands:
-    host_galaxy = run_aperture_photometry(host_galaxy, bandname,
-                                            image_column=f"image_filenames_{bandname}",
-                                            aperture_radius=1.0)
-df = host_galaxy
+    run_aperture_photometry(host_galaxy, bandname,
+                            image_column=f"image_filenames_{bandname}",
+                            aperture_radius=1.0)
 ```
 
 ```{code-cell} ipython3
 #take a quick look at the dataframe of aperture photometry to see what we are working with
-df
+host_galaxy
 ```
 
 ```{code-cell} ipython3
@@ -533,17 +530,15 @@ df
 jupyter:
   source_hidden: true
 ---
-def plot_single_band_light_curve(df, galaxy_id, bandname, start_mjd):
+def plot_single_band_light_curve(df, bandname, start_mjd):
     """
-    Plot a single galaxy's light curve from a DataFrame, with error bars.
+    Plot the TDE host galaxy light curve for a single band, with error bars.
 
     Parameters
     ----------
     df : pandas.DataFrame
-        Must contain columns 'galaxy_id', 'mjd_obs',
-        f'flux_{bandname}', and optionally f'flux_err_{bandname}'.
-    galaxy_id : int or str
-        Galaxy identifier to plot.
+        Must contain f'mjd_obs_{{bandname}}', f'flux_{{bandname}}',
+        and f'flux_err_{{bandname}}' columns.
     bandname : str
         Photometric band name used for column labels.
     start_mjd : float
@@ -554,11 +549,8 @@ def plot_single_band_light_curve(df, galaxy_id, bandname, start_mjd):
     matplotlib.figure.Figure
         The generated figure.
     """
-    #make a series for each galaxy
-    row = df[df["galaxy_id"] == galaxy_id].squeeze()
-    if row.empty:
-        print(f"⚠️ Galaxy {galaxy_id} not found in DataFrame.")
-        return None
+    row = df.iloc[0]
+    galaxy_id = row["galaxy_id"]
 
     # Extract nested arrays
     #need to go to numpy so we can check for non-finite values
@@ -571,7 +563,7 @@ def plot_single_band_light_curve(df, galaxy_id, bandname, start_mjd):
     mask &= np.isfinite(flux_errs)
     times, fluxes, flux_errs = times[mask], fluxes[mask], flux_errs[mask]
     if len(times) == 0:
-        print(f"⚠️ No valid flux points for galaxy {galaxy_id}.")
+        print(f"⚠️ No valid flux points.")
         return None
 
     #sort on time
@@ -678,13 +670,11 @@ def plot_multiband_light_curve(df, bands, start_mjd):
 ```
 
 ```{code-cell} ipython3
-#grab one of the galaxy_ids from the printed out dataframe above
-favorite = int(df.iloc[0]['galaxy_id'])
-fig_single = plot_single_band_light_curve(df, favorite, bands[0], start_mjd=tde_info["start_mjd"])
+fig_single = plot_single_band_light_curve(host_galaxy, bands[0], start_mjd=tde_info["start_mjd"])
 ```
 
 ```{code-cell} ipython3
-fig_light_curves = plot_multiband_light_curve(df, bands, start_mjd=tde_info["start_mjd"])
+fig_light_curves = plot_multiband_light_curve(host_galaxy, bands, start_mjd=tde_info["start_mjd"])
 ```
 
 ## 5. Make Cutouts
@@ -727,7 +717,7 @@ def make_cutout(fname, ra, dec, size=100):
             [header["CD2_1"], header["CD2_2"]],
         ])
         angle = header.get("ORIENTAT", 0.0)
-        rot_img = rotate(img, angle=angle, reshape=False, cval=np.nan)
+        rot_img = rotate(img, angle=-angle, reshape=False, cval=np.nan)
 
         # Update header for rotated WCS
         CD1_1_rot = np.cos(-angle * np.pi / 180)
@@ -849,9 +839,7 @@ def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list,
 # Number of cutout images to display. Increase to show more epochs.
 n_cutout_images = 6
 
-single_gal = df.loc[df["galaxy_id"] == favorite].squeeze()
-if single_gal.empty:
-    raise ValueError(f"Galaxy {favorite} not found in DataFrame.")
+single_gal = host_galaxy.iloc[0]
 
 selected_filenames = single_gal[f"image_filenames_{bands[0]}"][:n_cutout_images]
 selected_mjds = single_gal[f"mjd_obs_{bands[0]}"][:n_cutout_images]
@@ -865,7 +853,7 @@ cutout_gallery(
     aperture_radius_pix_list=selected_radius_pix,
     size=100,
     ncols=3,
-    galaxy_id=favorite,
+    galaxy_id=single_gal["galaxy_id"],
 )
 
 # You may get a `FITSFixedWarning` this is completely harmless and
