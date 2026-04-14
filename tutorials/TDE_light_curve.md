@@ -7,7 +7,7 @@ jupytext:
     jupytext_version: 1.19.1
 kernelspec:
   name: python3
-  display_name: python3
+  display_name: Python 3 (ipykernel)
   language: python
 ---
 
@@ -47,10 +47,6 @@ This notebook is designed to be run sequentially from top to bottom.  All code i
 
 ## Imports
 
-```{code-cell} ipython3
-import time
-starttime = time.time()
-```
 
 ```{code-cell} ipython3
 # Uncomment the next line to install dependencies if needed.
@@ -195,9 +191,6 @@ def show_gallery(files, max_images=9):
 n_gallery_images = 6
 show_gallery(files, max_images=n_gallery_images)
 ```
-
-
-+++
 
 ## 2. Find a TDE target from the transient catalog
 
@@ -687,7 +680,7 @@ jupyter:
 ---
 def make_cutout(fname, ra, dec, size=100):
     """
-    Create a sky-aligned cutout around (RA, Dec) from a Roman TDS FITS image on S3.
+    Create a North-up cutout around (RA, Dec) from a Roman TDS FITS image on S3.
 
     Parameters
     ----------
@@ -701,7 +694,7 @@ def make_cutout(fname, ra, dec, size=100):
     Returns
     -------
     cutout : astropy.nddata.Cutout2D or None
-        The rotated image cutout centered on (RA, Dec).
+        Cutout centered on (RA, Dec) and rotated so North points up.
         Returns None if the target is outside the field.
     """
 
@@ -710,36 +703,27 @@ def make_cutout(fname, ra, dec, size=100):
     with fits.open(fname, fsspec_kwargs={"anon": True}, memmap=False) as hdu:
         img = hdu[1].data
         header = hdu[1].header
-
-        # Get orientation and CD matrix
-        CDmat = np.array([
-            [header["CD1_1"], header["CD1_2"]],
-            [header["CD2_1"], header["CD2_2"]],
-        ])
-        angle = header.get("ORIENTAT", 0.0)
-        rot_img = rotate(img, angle=-angle, reshape=False, cval=np.nan)
-
-        # Update header for rotated WCS
-        CD1_1_rot = np.cos(-angle * np.pi / 180)
-        CD1_2_rot = -np.sin(-angle * np.pi / 180)
-        CD2_1_rot = np.sin(-angle * np.pi / 180)
-        CD2_2_rot = np.cos(-angle * np.pi / 180)
-        RotMat_inv = np.array([[CD1_1_rot, -CD1_2_rot],
-                                [-CD2_1_rot, CD2_2_rot]])
-        CDmat_rot = np.dot(CDmat, RotMat_inv)
-        header["CD1_1"], header["CD1_2"] = CDmat_rot[0]
-        header["CD2_1"], header["CD2_2"] = CDmat_rot[1]
-        header["ORIENTAT"] -= angle
-
-        rot_wcs = WCS(header)
+        wcs = WCS(header)
 
         try:
-            # Build cutout
-            cutout = Cutout2D(rot_img, coord, size, wcs=rot_wcs, mode="partial")
-            return cutout
+            # Step 1: extract cutout centered on target using the native WCS
+            cutout = Cutout2D(img, coord, size, wcs=wcs, mode="partial")
         except Exception as e:
             print(f"Error creating cutout for {fname}: {e}")
             return None
+
+        # Step 2: determine rotation angle to place North at the top.
+        # Invert the CD matrix to find the North direction in pixel space.
+        # This handles chip orientation automatically without needing SCA_NUM logic.
+        det = header['CD1_1'] * header['CD2_2'] - header['CD1_2'] * header['CD2_1']
+        north_col = -header['CD1_2'] / det
+        north_row =  header['CD1_1'] / det
+        angle = (-np.degrees(np.arctan2(north_col, north_row))) % 360
+
+        # Step 3: rotate only the small cutout (not the full image) to align North up
+        cutout.data = rotate(cutout.data, angle=angle, reshape=False, cval=np.nan)
+
+        return cutout
         
 ```
 
@@ -813,9 +797,10 @@ def cutout_gallery(image_filenames, mjd_list, ra, dec, aperture_radius_pix_list,
         img = cutout.data
         vmin, vmax = np.nanpercentile(img, [5, 99])
         ax.imshow(img, origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
-        # Draw the aperture circle in the cutout
-        sky_center = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
-        x_center, y_center = cutout.wcs.world_to_pixel(sky_center)
+        # Draw the aperture circle at the image center.
+        # The galaxy is centered by Cutout2D and stays centered after the North-up rotation.
+        x_center = img.shape[1] / 2.0
+        y_center = img.shape[0] / 2.0
         if np.isfinite(radius_pix) and radius_pix > 0:
             aperture_circle = plt.Circle((x_center, y_center), radius_pix,
                                          edgecolor="cyan", facecolor="none", linewidth=1.3)
@@ -860,6 +845,8 @@ cutout_gallery(
 # just means there is an extra space in the DATE-OBS keyword that astropy is fixing.
 ```
 
+Each cutout is extracted from the larger detector image and then rotated to place North up. The blank regions in the corners are areas outside the original square cutout that become empty after rotation.
+
 ## Acknowledgements
 
 - [IPAC-IRSA](https://irsa.ipac.caltech.edu/)
@@ -900,6 +887,3 @@ This tutorial was developed with the assistance of AI tools
 
 - [OpenUniverse et al., 2025](https://arxiv.org/abs/2501.05632)
 
-```{code-cell} ipython3
-print("elapsed time", time.time() - starttime)
-```
