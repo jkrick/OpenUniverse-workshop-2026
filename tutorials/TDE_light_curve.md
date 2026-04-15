@@ -320,8 +320,8 @@ def Roman_TDS_image_search(host_galaxy, radius, bandname):
 
     Returns
     -------
-    dict
-        Dictionary where keys are galaxy IDs and values are SIA result tables
+    astropy.table.Table
+        SIA result table filtered to TDE images in the specified band,
         with an added 's3_uri' column for the image file paths.
     """
     row = host_galaxy.iloc[0]
@@ -451,7 +451,7 @@ def run_aperture_photometry(host_galaxy, bandname, image_column="image_filenames
 
     row = host_galaxy.iloc[0]
     filenames = row[image_column]
-    print(f"Performing photometry for {len(filenames)} sampled images "
+    print(f"Performing photometry in {bandname} for {len(filenames)} sampled images "
           f"for host galaxy at RA={row['ra']:.3f}, Dec={row['dec']:.3f} ...", end="")
 
     mjd_list, flux_list, flux_err_list, aperture_radius_pix_list = [], [], [], []
